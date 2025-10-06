@@ -1,199 +1,252 @@
 #!/usr/bin/env python3
 """
-watch_videos.py
-- Open the emapp.cc/watch/... URL
-- Parse the JSON array of {"v": "...", "t": ...}
-- For each video id open YouTube, wait for duration robustly, play and wait
-- After all videos, ensure total runtime >= 3600s (1 hour). If less, sleep remaining.
+Play all YouTube embeds on an emapp.cc/watch/... page (inline).
+- Does NOT open individual YouTube pages.
+- Tries to enable JS API on each iframe and send play commands.
+- Uses YT Data API (if YT_API_KEY env var present) to fetch exact durations.
+- Otherwise falls back to FALLBACK_PER_VIDEO seconds.
+- Waits for the max duration (videos assumed to play concurrently).
 """
 
-import time
-import json
-import sys
-import math
-import re
+import os, time, json, math, re, sys
 import urllib.parse as up
-
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
-# --- CONFIG ---
-# Put your emapp url here (percent-encoded JSON in path). Example from you:
-INITIAL_URL = r'http://emapp.cc/watch/%5B%7B%22v%22%3A%22VaWr_jHqcuE%22%2C%22t%22%3A0%7D%2C%7B%22v%22%3A%22VaWr_jHqcuE%22%2C%22t%22%3A0%7D%5D'
-# Minimum total runtime required (seconds)
-TARGET_TOTAL_SECONDS = 3600
-# Fallback per-video wait if duration not available
-FALLBACK_WAIT_SECONDS = 60
-# Small buffer added after video duration
-BUFFER_AFTER = 1.5
-# --- end CONFIG ---
+# CONFIG
+PAGE_URL = r'http://emapp.cc/watch/%5B%7B%22v%22%3A%22VaWr_jHqcuE%22%2C%22t%22%3A0%7D%2C%7B%22v%22%3A%22VaWr_jHqcuE%22%2C%22t%22%3A0%7D%5D'
+FALLBACK_PER_VIDEO = 60         # seconds if no API/duration available
+BUFFER_AFTER = 2.0              # extra seconds after max duration
+HEADLESS = True
+YT_API_KEY = os.getenv("YT_API_KEY")  # optional; set for accurate durations
+# --- end config
 
-def log(msg):
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+def log(s): 
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {s}", flush=True)
 
-def decode_and_extract_json_from_url(url):
-    """Decode percent-encoding and return JSON substring between first '[' and last ']'."""
-    decoded = up.unquote(url)
+def parse_ids_from_url(url):
     try:
-        start = decoded.index('[')
-        end = decoded.rindex(']') + 1
-        raw = decoded[start:end]
-        return raw
-    except ValueError:
-        return None
-
-def extract_video_ids_from_string(s):
-    """Try to load JSON arr or fallback to regex for youtube ids."""
-    if not s:
-        return []
-    # try JSON
-    try:
-        arr = json.loads(s)
-        ids = [item.get('v') for item in arr if isinstance(item, dict) and item.get('v')]
+        dec = up.unquote(url)
+        start = dec.index('[')
+        end = dec.rindex(']') + 1
+        arr = json.loads(dec[start:end])
+        ids = [it.get('v') for it in arr if isinstance(it, dict) and it.get('v')]
         return ids
     except Exception:
-        pass
-    # fallback: find all 11-char youtube ids
-    ids = re.findall(r'([A-Za-z0-9_-]{11})', s)
-    return ids
+        # fallback regex (11-char YouTube IDs)
+        return re.findall(r'([A-Za-z0-9_-]{11})', url)
 
-def setup_driver(headless=True):
+def seconds_from_iso8601(d):
+    # Parses YouTube duration like 'PT1M23S' -> seconds
+    if not d or not d.startswith('P'):
+        return None
+    # simple parser
+    m = re.match(r'P(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)', d)
+    if not m:
+        return None
+    h = int(m.group(1) or 0)
+    m_ = int(m.group(2) or 0)
+    s = int(m.group(3) or 0)
+    return h*3600 + m_*60 + s
+
+def fetch_durations_youtube(ids):
+    # returns dict id->seconds or empty dict on failure
+    if not YT_API_KEY:
+        return {}
+    try:
+        import requests
+    except Exception:
+        log("requests not installed; cannot call YouTube API.")
+        return {}
+    if not ids:
+        return {}
+    # YouTube API limits 50 ids per call
+    out = {}
+    BATCH = 50
+    for i in range(0, len(ids), BATCH):
+        batch = ids[i:i+BATCH]
+        q = ",".join(batch)
+        url = ("https://www.googleapis.com/youtube/v3/videos"
+               f"?part=contentDetails&id={q}&key={YT_API_KEY}")
+        try:
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            for item in data.get("items", []):
+                vid = item.get("id")
+                iso = item.get("contentDetails", {}).get("duration")
+                sec = seconds_from_iso8601(iso)
+                out[vid] = sec if sec is not None else None
+        except Exception as e:
+            log(f"YouTube API error: {e}")
+            return {}
+    return out
+
+def setup_driver():
     opts = Options()
-    if headless:
+    if HEADLESS:
         opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--mute-audio")
-    # try to avoid click-to-play policies
     opts.add_argument("--autoplay-policy=no-user-gesture-required")
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(60)
     return driver
 
-def wait_for_numeric_duration(driver, timeout=20):
-    """Polls the page for an HTML5 <video> duration that is numeric and > 0."""
-    deadline = time.time() + timeout
+def enable_jsapi_and_play_all(driver, origin):
+    """
+    In-page JS:
+    - find all <iframe> with youtube embed src
+    - append enablejsapi=1&origin=ORIGIN to each src (if not present) and reload it
+    - then send the postMessage command to play; also try to click overlays as a fallback
+    Returns count of targets found.
+    """
+    script = """
+    (function(origin){
+        const iframes = Array.from(document.querySelectorAll('iframe'))
+            .filter(f => f.src && f.src.includes('youtube.com'));
+        const results = [];
+        iframes.forEach((f,idx) => {
+            try {
+                let src = f.src;
+                const u = new URL(src, location.href);
+                // ensure embed path uses /embed/VIDEOID if possible (leave as-is otherwise)
+                if(!u.searchParams.get('enablejsapi')) {
+                    u.searchParams.set('enablejsapi','1');
+                }
+                if(!u.searchParams.get('origin')) {
+                    u.searchParams.set('origin', origin);
+                }
+                // update src only if changed
+                if(u.toString() !== src) {
+                    f.src = u.toString();
+                }
+                // small delay to allow iframe to load
+                results.push({idx: idx, status: 'patched', src: f.src});
+            } catch(e) {
+                results.push({idx: idx, status: 'err', err: String(e)});
+            }
+        });
+        // after a short wait, send play commands
+        setTimeout(() => {
+            const played = [];
+            Array.from(document.querySelectorAll('iframe'))
+                 .filter(f => f.src && f.src.includes('youtube.com'))
+                 .forEach(f => {
+                    try {
+                        // postMessage for YT iframe API
+                        f.contentWindow.postMessage(JSON.stringify({event:'command',func:'playVideo',args:[]}), '*');
+                        played.push({src: f.src, method: 'postMessage'});
+                    } catch(e){
+                        // fallback: try to click overlay/play button inside parent
+                        try {
+                            const r = f.getBoundingClientRect();
+                            const x = r.left + r.width/2;
+                            const y = r.top + r.height/2;
+                            const ev = new MouseEvent('click', {bubbles:true, cancelable:true, view:window, clientX:x, clientY:y});
+                            f.dispatchEvent(ev);
+                            played.push({src: f.src, method: 'click-dispatch'});
+                        } catch(ee){
+                            played.push({src: f.src, method: 'failed', err: String(ee)});
+                        }
+                    }
+                 });
+            // expose results
+            window._emapp_play_results = {patched: results, played: played, timestamp: Date.now()};
+        }, 1200);
+        return {found: results.length};
+    })(arguments[0]);
+    """
     try:
-        # wait for video element to appear first
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "video")))
-    except Exception:
-        # video element didn't appear in time
-        return None
-
-    while time.time() < deadline:
-        try:
-            dur = driver.execute_script(
-                "const v = document.querySelector('video');"
-                "if (!v) return null;"
-                "return v.duration;"
-            )
-        except Exception:
-            dur = None
-
-        # dur may be None, NaN, 0, or a positive float
-        if isinstance(dur, (int, float)) and not math.isnan(dur) and dur > 0.01:
-            return float(dur)
-        time.sleep(0.4)
-    return None
-
-def open_and_watch(driver, video_id):
-    """Open YouTube watch page and attempt to play and wait for duration."""
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    log(f"Opening YouTube video: {url}")
-    try:
-        driver.get(url)
+        res = driver.execute_script(script, origin)
+        return res.get('found', 0)
     except Exception as e:
-        log(f"Page load error for {video_id}: {e}")
-        return 0.0
-
-    # Attempt to play using HTML5 video element
-    try:
-        # Click policy: execute play() via JS
-        driver.execute_script("const v = document.querySelector('video'); if (v) { try { v.play(); } catch(e){} }")
-    except Exception:
-        pass
-
-    duration = wait_for_numeric_duration(driver, timeout=20)
-    if duration is not None:
-        wait_time = duration + BUFFER_AFTER
-        log(f"Video duration: {duration:.1f}s, waiting {wait_time:.1f}s to finish")
-        time.sleep(wait_time)
-        return float(duration)
-    else:
-        # fallback
-        log(f"No numeric duration detected for {video_id}. Falling back to {FALLBACK_WAIT_SECONDS}s wait.")
-        time.sleep(FALLBACK_WAIT_SECONDS)
-        return float(FALLBACK_WAIT_SECONDS)
-
-def main():
-    driver = None
-    total_watched = 0.0
-    try:
-        driver = setup_driver(headless=True)
-        log(f"Visiting initial URL: {INITIAL_URL}")
-        try:
-            driver.get(INITIAL_URL)
-        except Exception as e:
-            log(f"Initial page load failed (continuing): {e}")
-
-        # Prefer the actual current URL after redirects (sometimes the browser will decode)
-        current = driver.current_url or INITIAL_URL
-        decoded_json = decode_and_extract_json_from_url(current)
-        ids = extract_video_ids_from_string(decoded_json) if decoded_json else []
-        if not ids:
-            # try extracting from the raw initial URL string
-            decoded_json2 = decode_and_extract_json_from_url(INITIAL_URL)
-            ids = extract_video_ids_from_string(decoded_json2) if decoded_json2 else []
-
-        if not ids:
-            # last fallback: try to extract a single video id from the url or current_url
-            ids = extract_video_ids_from_string(current + " " + INITIAL_URL)
-
-        if not ids:
-            log("No video IDs found. Exiting.")
-            return 1
-
-        log(f"Found {len(ids)} video id(s). Order preserved.")
-        for i, vid in enumerate(ids, 1):
-            log(f"Playing {i}/{len(ids)} -> {vid}")
-            dur = open_and_watch(driver, vid)
-            total_watched += float(dur)
-            # small pause between videos
-            time.sleep(1.0)
-
-        # Ensure total runtime >= TARGET_TOTAL_SECONDS (1 hour default)
-        total = int(math.floor(total_watched))
-        # arithmetic (digit-by-digit) example will be printed below
-        if total < TARGET_TOTAL_SECONDS:
-            remaining = TARGET_TOTAL_SECONDS - total
-            # show calculation digits in log
-            a = str(TARGET_TOTAL_SECONDS)
-            b = str(total).rjust(len(a), "0")
-            # e.g. "3600 - 0150 = 3450"
-            log(f"Calculation: {a} - {b} = {str(remaining).rjust(len(a),'0')}")
-            log(f"Total watched (seconds): {total}. Sleeping remaining {remaining}s to reach {TARGET_TOTAL_SECONDS}s.")
-            time.sleep(remaining)
-        else:
-            log(f"Total watched (seconds): {total}. Target {TARGET_TOTAL_SECONDS}s reached or exceeded; not sleeping extra.")
-
-        log("All videos watched + total-hour enforced. Closing browser.")
-        driver.quit()
+        log(f"JS injection/play error: {e}")
         return 0
 
+def main():
+    ids = parse_ids_from_url(PAGE_URL)
+    if not ids:
+        log("No video IDs parsed from URL. Exiting.")
+        return 1
+    log(f"Parsed {len(ids)} video id(s) from URL (order preserved).")
+
+    # get durations (prefer YT API)
+    durations = fetch_durations_youtube(ids)
+    if durations:
+        log("Fetched durations from YouTube Data API for some/all videos.")
+    else:
+        log("No YT_API_KEY or API fetch failed — falling back to default per-video duration.")
+
+    # compute max duration
+    dur_list = []
+    for vid in ids:
+        sec = durations.get(vid) if durations else None
+        if sec is None:
+            sec = FALLBACK_PER_VIDEO
+        dur_list.append((vid, int(sec)))
+    max_dur = max([d for (_, d) in dur_list]) if dur_list else FALLBACK_PER_VIDEO
+    # Digit-by-digit arithmetic example: max_dur + BUFFER_AFTER
+    a = str(max_dur).rjust(4,'0')
+    b = str(int(BUFFER_AFTER)).rjust(1,'0')
+    log(f"Max durations per video (sample): {dur_list[:6]} ...")
+    log(f"Wait calculation: max_dur = {max_dur} seconds; buffer = {BUFFER_AFTER}s")
+
+    driver = None
+    try:
+        driver = setup_driver()
+        log(f"Opening page: {PAGE_URL}")
+        driver.get(PAGE_URL)
+        origin = up.urlparse(driver.current_url).scheme + "://" + up.urlparse(driver.current_url).netloc
+        found = enable_jsapi_and_play_all(driver, origin)
+        if found == 0:
+            log("No youtube iframes found on page (or JS failed). Attempting to play HTML5 <video> tags directly.")
+            # try to play any <video> tags inline
+            try:
+                vcount = driver.execute_script("""
+                    var vs = document.querySelectorAll('video');
+                    vs.forEach(v => { try { v.play(); } catch(e){} });
+                    return vs.length;
+                """)
+                log(f"HTML5 video tags played: {vcount}")
+            except Exception as e:
+                log(f"Error trying to play <video> tags: {e}")
+        else:
+            log(f"Triggered play on {found} youtube iframe(s) (in-page).")
+
+        # Wait for the longest video + buffer
+        total_wait = int(math.ceil(max_dur + BUFFER_AFTER))
+        # Show arithmetic digit-by-digit: example "0120 + 02 = 0122" (pad to 4 digits)
+        pad = max(4, len(str(total_wait)))
+        left = str(max_dur).rjust(pad,'0')
+        right = str(int(BUFFER_AFTER)).rjust(pad,'0')
+        result = str(total_wait).rjust(pad,'0')
+        log(f"Calculation: {left} + {right} = {result}")
+        log(f"Sleeping {total_wait}s while videos play inline (max duration).")
+        time.sleep(total_wait)
+
+        # optional: collect in-page results
+        try:
+            info = driver.execute_script("return window._emapp_play_results || null;")
+            log(f"In-page play results: {info}")
+        except Exception:
+            pass
+
+        log("Done waiting. Closing browser.")
+        driver.quit()
+        return 0
     except Exception as e:
-        log(f"Fatal error: {e}")
+        log(f"Fatal: {e}")
         if driver:
             try:
                 driver.quit()
-            except Exception:
-                pass
+            except: pass
         return 2
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())
