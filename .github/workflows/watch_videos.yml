@@ -6,10 +6,11 @@ on:
 jobs:
   watch-videos:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -22,4 +23,7 @@ jobs:
           pip install selenium webdriver-manager
 
       - name: Run Selenium script
-        run: python watch_videos.py
+        env:
+          PYTHONUNBUFFERED: 1
+        run: |
+          python watch_videos.py
