@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
 """
-watch_videos.py — new-from-scratch inline player.
+watch_videos.py — Play ALL YouTube embeds on the emapp page inline and wait until every one ends.
 
 Behavior:
-- Open PAGE_URL (or EMAPP_URL env).
-- Discover all youtube iframes (recursive including shadow roots).
-- Patch iframe src to include enablejsapi=1 & origin.
-- Inject parent-side message listener to capture YouTube iframe state messages and HTML5 <video> ended events.
-- Simulate a user gesture (CDP mouse click) on each iframe to satisfy autoplay.
-- postMessage({event:'command',func:'playVideo',args:[]}) to each iframe.
-- Poll status until all tracked items report ended, then exit.
+- Visit PAGE_URL (or EMAPP_URL env).
+- Recursively discover all <iframe> (incl. shadow DOM) that point to youtube.com.
+- Patch each iframe src to include enablejsapi=1 & origin.
+- Load YouTube IFrame API if needed.
+- Create YT.Player for each iframe id.
+- Trigger player.playVideo() for each player, with CDP click fallback.
+- Compute remaining time = duration - currentTime per player; sleep max remaining + buffer.
+- Final-check: poll getPlayerState() until all ENDED (0) or fallback polite poll.
+- Close browser and exit.
 
-Overwrite your current file with this. Run headful first (HEADLESS=False) to watch it.
+Overwrite the file and run. Set HEADLESS=False for visual debug.
 """
-import os, time, json, math, urllib.parse as up, sys
+import os, time, math, sys, urllib.parse as up
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
-# -------- CONFIG --------
+# CONFIG (edit if needed)
 PAGE_URL = os.getenv("EMAPP_URL") or "http://emapp.cc/watch/%5B%7B%22v%22%3A%22VaWr_jHqcuE%22%2C%22t%22%3A0%7D%2C%7B%22v%22%3A%22VaWr_jHqcuE%22%2C%22t%22%3A0%7D%5D"
-HEADLESS = True   # set False to debug visually
-POLL_INTERVAL = 2.0
-MAX_WAIT_SECONDS = 60 * 60 * 6   # safety cap 6 hours; set to None for infinite (not recommended)
-# ------------------------
+HEADLESS = True           # set False to see the browser
+POLL_INTERVAL = 2.0       # seconds for fallback polling
+MAX_INITIAL_WAIT = 300    # seconds to wait for iframes to appear (no-hurry)
+MAX_WAIT_SECONDS = 60*60*6  # safety cap (6 hours)
+BUFFER_AFTER = 4          # seconds extra after computed remaining
+# --------------------------
 
-def log(s):
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {s}", flush=True)
+def log(msg):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 def setup_driver():
     opts = Options()
@@ -36,25 +40,20 @@ def setup_driver():
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--mute-audio")
-    # enable autoplay policy relaxation (may still require user gesture)
     opts.add_argument("--autoplay-policy=no-user-gesture-required")
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(120)
     return driver
 
-# Use CDP to simulate a real user click at element center
+# CDP click to simulate user gesture
 def cdp_click_element(driver, element):
     try:
-        rect = driver.execute_script(
-            "const r = arguments[0].getBoundingClientRect(); return {left:r.left,top:r.top,width:r.width,height:r.height};",
-            element
-        )
-        if not rect:
+        dim = driver.execute_script("const r=arguments[0].getBoundingClientRect(); return {left:r.left,top:r.top,width:r.width,height:r.height};", element)
+        if not dim:
             return False
-        cx = rect['left'] + rect['width'] / 2.0
-        cy = rect['top'] + rect['height'] / 2.0
-        # dispatch mousePressed and mouseReleased
+        cx = dim['left'] + dim['width']/2.0
+        cy = dim['top'] + dim['height']/2.0
         driver.execute_cdp_cmd("Input.dispatchMouseEvent", {"type":"mousePressed","button":"left","x":cx,"y":cy,"clickCount":1})
         driver.execute_cdp_cmd("Input.dispatchMouseEvent", {"type":"mouseReleased","button":"left","x":cx,"y":cy,"clickCount":1})
         time.sleep(0.35)
@@ -62,201 +61,240 @@ def cdp_click_element(driver, element):
     except Exception:
         return False
 
-# JS snippet: recursive shadow-root-aware iframe discovery + parent-side watcher injection
-INJECT_WATCHER_JS = r"""
+# Injected JS: recursive iframe collection (shadow-aware), patch src, register basic watch object
+INJECT_DISCOVER_AND_PATCH_JS = r"""
 (function(origin){
-    // Utility: find all iframes even inside shadow roots
-    function collectIframes(root){
-        var out = [];
-        function walk(node){
-            try {
-                if(!node) return;
-                if(node.nodeType === Node.DOCUMENT_NODE || node.nodeType === Node.ELEMENT_NODE) {
-                    if(node.tagName === 'IFRAME') out.push(node);
-                    // handle shadow root
-                    var children = node.children || [];
-                    for(var i=0;i<children.length;i++) walk(children[i]);
-                    if(node.shadowRoot) walk(node.shadowRoot);
-                }
-            } catch(e){}
-        }
-        walk(root || document);
-        return out;
+    function walk(node, out){
+        try {
+            if(!node) return;
+            if(node.nodeType === Node.ELEMENT_NODE) {
+                if(node.tagName === 'IFRAME') out.push(node);
+                // children
+                var children = node.children || [];
+                for(var i=0;i<children.length;i++) walk(children[i], out);
+                // shadow root
+                if(node.shadowRoot) walk(node.shadowRoot, out);
+            } else if(node.nodeType === Node.DOCUMENT_NODE) {
+                var c = node.children || [];
+                for(var i=0;i<c.length;i++) walk(c[i], out);
+            }
+        } catch(e){}
     }
-
-    // Ensure a global status object exists
-    window._emapp_watch = window._emapp_watch || {players:{}, html_videos:{} , createdAt: Date.now()};
-
-    // attach message listener (idempotent)
-    if(!window._emapp_watch._listenerAdded) {
-        window.addEventListener('message', function(ev){
-            // try to parse what YouTube IFrame API sends
-            try {
-                var d = ev.data;
-                // some players send strings
-                if(typeof d === 'string') {
-                    try { d = JSON.parse(d); } catch(e){}
-                }
-                // if it's an object with event/onStateChange
-                if(d && typeof d === 'object') {
-                    // YouTube IFrame events often have 'event' and 'info' or 'data'
-                    var evName = d.event || d.eventName || d.type || null;
-                    var info = d.info || d.data || d.infoState || null;
-                    // onStateChange -> info 0 means ended; some frames use 'onStateChange' with data 0
-                    if(evName === 'onStateChange' || evName === 'stateChange' || (d && d.event === 'onStateChange')) {
-                        try {
-                            var vid = (d.id || d.playerId || (ev && ev.source && ev.source.location && ev.source.location.href) || null);
-                        }catch(e){ vid = null; }
-                        // normalize: use source origin + possible embedded videoId from d?
-                        // Mark ended if info == 0
-                        var ended = false;
-                        if(typeof info === 'number' && info === 0) ended = true;
-                        if(d && d.info === 0) ended = true;
-                        // Best-effort: if message contains 'state' or 'info' keys
-                        // Use ev.origin+maybe video id as key; simpler: iterate known players and try match by origin
-                        Object.keys(window._emapp_watch.players).forEach(function(k){
-                            var rec = window._emapp_watch.players[k];
-                            try {
-                                if(rec && rec.origin === ev.origin) {
-                                    if(ended) rec.ended = true;
-                                    rec.lastMsg = d;
-                                }
-                            } catch(e){}
-                        });
-                    }
-                }
-            } catch(e){}
-        }, false);
-        window._emapp_watch._listenerAdded = true;
-    }
-
-    // collect iframe elements
-    var frames = collectIframes(document);
+    var out = [];
+    walk(document, out);
+    // create global store
+    window._emapp_all_players = window._emapp_all_players || {players:{} , html_videos:{}};
     var created = 0;
-    frames.forEach(function(f, idx){
+    out.forEach(function(f, i){
         try {
             var src = f.src || f.getAttribute('src') || '';
-            // only youtube embeds
             if(!src || src.indexOf('youtube.com') === -1) return;
-            // ensure element has id
-            if(!f.id) f.id = 'emapp_iframe_' + idx + '_' + Math.floor(Math.random()*100000);
-            var id = f.id;
-            // ensure enablejsapi & origin present
+            if(!f.id) f.id = 'emapp_iframe_' + i + '_' + Math.floor(Math.random()*100000);
+            // patch enablejsapi & origin
             try {
                 var u = new URL(src, location.href);
                 if(!u.searchParams.get('enablejsapi')) u.searchParams.set('enablejsapi','1');
                 if(!u.searchParams.get('origin')) u.searchParams.set('origin', origin);
                 var newsrc = u.toString();
-                if(newsrc !== src) { f.src = newsrc; src = newsrc; }
+                if(newsrc !== src) f.src = newsrc;
+                src = newsrc;
             } catch(e){}
-            // store a record
-            window._emapp_watch.players[id] = window._emapp_watch.players[id] || {id:id, src: src, origin: (new URL(src, location.href)).origin, ended:false, lastMsg:null};
+            window._emapp_all_players.players[f.id] = {id:f.id, src:src, origin:(new URL(src, location.href)).origin, ended:false};
             created++;
         } catch(e){}
     });
-
-    // register HTML5 videos
+    // register HTML5 <video> tags
     try {
         var vids = Array.from(document.querySelectorAll('video'));
         vids.forEach(function(v,i){
             try {
                 if(!v.id) v.id = 'emapp_htmlvideo_' + i + '_' + Math.floor(Math.random()*100000);
-                var id = v.id;
-                window._emapp_watch.html_videos[id] = window._emapp_watch.html_videos[id] || {id:id, ended:!!v.ended, duration: v.duration || null, started:false};
-                if(!window._emapp_watch.html_videos[id].listenerAdded) {
-                    v.addEventListener('play', function(){ window._emapp_watch.html_videos[id].started = true; });
-                    v.addEventListener('ended', function(){ window._emapp_watch.html_videos[id].ended = true; });
-                    window._emapp_watch.html_videos[id].listenerAdded = true;
+                var uid = v.id;
+                window._emapp_all_players.html_videos[uid] = window._emapp_all_players.html_videos[uid] || {id:uid, ended: !!v.ended, duration: v.duration || null, started:false};
+                if(!window._emapp_all_players.html_videos[uid].listenerAdded) {
+                    v.addEventListener('play', function(){ window._emapp_all_players.html_videos[uid].started = true; });
+                    v.addEventListener('ended', function(){ window._emapp_all_players.html_videos[uid].ended = true; });
+                    window._emapp_all_players.html_videos[uid].listenerAdded = true;
                 }
             } catch(e){}
         });
     } catch(e){}
-
-    // expose small helpers
-    window._emapp_watch.getStatus = function(){
-        var out = {players:{}, html_videos:{}, timestamp: Date.now()};
-        try {
-            Object.keys(window._emapp_watch.players).forEach(function(k){
-                var r = window._emapp_watch.players[k];
-                out.players[k] = {id:r.id, ended: !!r.ended, src: r.src, origin: r.origin, lastMsg: r.lastMsg || null};
-            });
-        } catch(e){}
-        try {
-            Object.keys(window._emapp_watch.html_videos).forEach(function(k){
-                var r = window._emapp_watch.html_videos[k];
-                out.html_videos[k] = {id:r.id, ended: !!r.ended, duration: r.duration || null, started: !!r.started};
-            });
-        } catch(e){}
-        return out;
-    };
-
-    window._emapp_watch.playAll = function(){
-        // for each iframe, attempt a postMessage play command
-        try {
-            Object.keys(window._emapp_watch.players).forEach(function(k){
-                try {
-                    var rec = window._emapp_watch.players[k];
-                    var el = document.getElementById(k);
-                    // try to call postMessage to origin
-                    var payload = JSON.stringify({event:'command',func:'playVideo',args:[]});
-                    try {
-                        if(el && el.contentWindow) {
-                            el.contentWindow.postMessage(payload, rec.origin || '*');
-                        }
-                    } catch(e){}
-                    // also try fallback target '*' (some browsers)
-                    try {
-                        if(el && el.contentWindow) el.contentWindow.postMessage(payload, '*');
-                    } catch(e){}
-                } catch(e){}
-            });
-            // also try HTML5 video play
-            Array.from(document.querySelectorAll('video')).forEach(function(v){
-                try { v.play().catch(()=>{}); } catch(e){}
-            });
-            return true;
-        } catch(e){ return false; }
-    };
-
-    return {created: created, players: Object.keys(window._emapp_watch.players).length, html_videos: Object.keys(window._emapp_watch.html_videos).length};
+    return {iframes_found: out.length, players_registered: Object.keys(window._emapp_all_players.players).length, html_videos: Object.keys(window._emapp_all_players.html_videos).length};
 })(arguments[0]);
 """
 
-def get_status(driver):
+# helper to fetch status snapshot from page
+GET_STATUS_JS = r"""
+(function(){
+    var out = {players:{}, html_videos:{}, ts: Date.now()};
+    try {
+        var p = window._emapp_all_players && window._emapp_all_players.players || {};
+        Object.keys(p).forEach(function(k){
+            try {
+                out.players[k] = {id:k, src: p[k].src, origin: p[k].origin, ended: !!p[k].ended};
+            } catch(e){}
+        });
+    } catch(e){}
+    try {
+        var h = window._emapp_all_players && window._emapp_all_players.html_videos || {};
+        Object.keys(h).forEach(function(k){
+            try { out.html_videos[k] = {id:k, ended: !!h[k].ended, started: !!h[k].started, duration: h[k].duration || null}; } catch(e){}
+        });
+    } catch(e){}
+    return out;
+})();
+"""
+
+def ensure_yt_iframe_api(driver):
+    # inject script tag if not already
     try:
-        res = driver.execute_script("return (window._emapp_watch && window._emapp_watch.getStatus) ? window._emapp_watch.getStatus() : null;")
+        driver.execute_script("""
+            if(!window._emapp_yt_api_injected){
+                var s = document.createElement('script');
+                s.src = 'https://www.youtube.com/iframe_api';
+                document.head.appendChild(s);
+                window._emapp_yt_api_injected = true;
+            }
+        """)
+    except Exception:
+        pass
+    # wait a bit for YT to become available
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        try:
+            ok = driver.execute_script("return (typeof YT !== 'undefined' && YT && YT.Player) ? true : false;")
+            if ok:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.6)
+    return False
+
+def create_yt_players(driver):
+    # create YT.Player instances for every registered iframe id
+    CREATE_JS = r"""
+    (function(){
+        if(typeof YT === 'undefined' || !YT.Player) return {status:'no_api'};
+        window._emapp_yt_players = window._emapp_yt_players || {};
+        var regs = window._emapp_all_players && window._emapp_all_players.players || {};
+        var created = 0;
+        Object.keys(regs).forEach(function(k){
+            try {
+                if(window._emapp_yt_players[k] && window._emapp_yt_players[k].player) return;
+                var player = new YT.Player(k, {
+                    events: {
+                        'onReady': function(e){
+                            try { window._emapp_yt_players[k] = window._emapp_yt_players[k] || {}; window._emapp_yt_players[k].player = e.target; } catch(e){}
+                        },
+                        'onStateChange': function(e){
+                            try {
+                                var id = (e && e.target && e.target.getIframe) ? e.target.getIframe().id : null;
+                                if(!id) id = 'unknown';
+                                window._emapp_all_players.players[id] = window._emapp_all_players.players[id] || {};
+                                if(e.data === 0) window._emapp_all_players.players[id].ended = true;
+                                window._emapp_yt_players[id] = window._emapp_yt_players[id] || {};
+                                window._emapp_yt_players[id].lastState = e.data;
+                            } catch(e){}
+                        }
+                    }
+                });
+                window._emapp_yt_players[k] = {player: player, createdAt: Date.now(), ended:false};
+                created++;
+            } catch(e){}
+        });
+        return {created:created, total_reg: Object.keys(regs).length};
+    })();
+    """
+    try:
+        res = driver.execute_script(CREATE_JS)
         return res
-    except Exception:
-        return None
+    except Exception as e:
+        return {"error": str(e)}
 
-def play_all_via_page(driver):
+def invoke_play_on_players(driver):
+    # try player.playVideo() for all created players
     try:
-        ok = driver.execute_script("return (window._emapp_watch && window._emapp_watch.playAll) ? window._emapp_watch.playAll() : false;")
-        return bool(ok)
+        driver.execute_script(r"""
+            try {
+                Object.keys(window._emapp_yt_players || {}).forEach(function(k){
+                    try {
+                        var r = window._emapp_yt_players[k];
+                        if(r && r.player && r.player.playVideo) {
+                            try { r.player.playVideo(); } catch(e){}
+                        }
+                    } catch(e){}
+                });
+            } catch(e){}
+        """)
     except Exception:
-        return False
-
-def find_iframes_elements(driver):
-    # Selenium can't easily access shadow DOM recursively; use JS to return list of element ids we recorded
+        pass
+    # also try HTML5 video play()
     try:
-        ids = driver.execute_script("return Object.keys((window._emapp_watch && window._emapp_watch.players) || {});")
-        if not ids:
-            return []
-        elems = []
-        for i in ids:
+        driver.execute_script("Array.from(document.querySelectorAll('video')).forEach(v=>{ try{ v.play().catch(()=>{}); } catch(e){} });")
+    except Exception:
+        pass
+
+def cdp_click_ids(driver, ids):
+    for elid in ids:
+        try:
+            el = None
             try:
-                el = driver.find_element("id", i)
-                elems.append(el)
+                el = driver.find_element("id", elid)
             except Exception:
-                # element might be inside shadow DOM — try JS to get bounding rect
+                # element might be inside shadow; try JS scrollIntoView by id
                 try:
-                    rect = driver.execute_script("var el=document.getElementById(arguments[0]); if(!el){ return null;} var r = el.getBoundingClientRect(); return {left:r.left, top:r.top, width:r.width, height:r.height};", i)
-                    # fallback: ignore if not found
+                    driver.execute_script("var e=document.getElementById(arguments[0]); if(e) e.scrollIntoView({block:'center'});", elid)
                 except Exception:
                     pass
-        return elems
+            if el:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                time.sleep(0.15)
+                ok = cdp_click_element(driver, el)
+                log(f"CDP click {elid} -> {ok}")
+        except Exception:
+            pass
+
+def fetch_players_times(driver):
+    # returns dict id -> {state, duration, current}
+    try:
+        return driver.execute_script(r"""
+            (function(){
+                var out = {};
+                try {
+                    var map = window._emapp_yt_players || {};
+                    Object.keys(map).forEach(function(k){
+                        try {
+                            var p = map[k].player;
+                            var st = (p && p.getPlayerState) ? p.getPlayerState() : null;
+                            var dur = (p && p.getDuration) ? (function(){ try { var d = p.getDuration(); return (isNaN(d) ? null : Math.floor(d)); } catch(e){ return null; } })() : null;
+                            var cur = (p && p.getCurrentTime) ? (function(){ try { var c = p.getCurrentTime(); return (isNaN(c) ? null : Math.floor(c)); } catch(e){ return null; } })() : null;
+                            out[k] = {state: st, duration: dur, current: cur};
+                        } catch(e){}
+                    });
+                } catch(e){}
+                return out;
+            })();
+        """)
     except Exception:
-        return []
+        return {}
+
+def polite_poll_for_end(driver):
+    log("Fallback polite polling until page reports all ended (may take long).")
+    start = time.time()
+    while True:
+        status = driver.execute_script(GET_STATUS_JS)
+        players = status.get("players", {}) if isinstance(status, dict) else {}
+        html_videos = status.get("html_videos", {}) if isinstance(status, dict) else {}
+        total = len(players) + len(html_videos)
+        ended = sum(1 for v in players.values() if v.get("ended")) + sum(1 for v in html_videos.values() if v.get("ended"))
+        log(f"Polite poll: total={total}, ended={ended}")
+        if total > 0 and ended >= total:
+            log("Polite poll: all ended.")
+            return True
+        if MAX_WAIT_SECONDS and (time.time()-start) > MAX_WAIT_SECONDS:
+            log("Polite poll: reached safety cap. Exiting poll.")
+            return False
+        time.sleep(POLL_INTERVAL)
 
 def main():
     driver = None
@@ -264,110 +302,146 @@ def main():
         driver = setup_driver()
         log(f"Opening page: {PAGE_URL}")
         driver.get(PAGE_URL)
-        # small initial wait for lazy loads
-        time.sleep(1.0)
 
-        origin = up.urlparse(driver.current_url).scheme + "://" + up.urlparse(driver.current_url).netloc
-        log(f"Origin resolved: {origin}")
-
-        # inject watcher + discover frames (this will search shadow roots too)
-        log("Injecting in-page watcher (shadow-aware) and discovering players/videos...")
-        inject_res = driver.execute_script(INJECT_WATCHER_JS, origin)
-        log(f"Injection returned: {inject_res}")
-
-        # give the page a moment to patch srcs and load iframes
-        time.sleep(1.2)
-
-        # try to bring known iframe elements into view and simulate click (user gesture)
-        # find element ids recorded in page
-        try:
-            recorded_ids = driver.execute_script("return Object.keys((window._emapp_watch && window._emapp_watch.players) || {});")
-        except Exception:
-            recorded_ids = []
-
-        log(f"Tracked iframe ids count: {len(recorded_ids)}")
-        # for each id try to scroll it into view and click via CDP for user gesture
-        for idx, elid in enumerate(recorded_ids):
+        # wait patiently for iframes/video tags to appear
+        log("Waiting for iframes or <video> tags to appear (no hurry).")
+        t0 = time.time()
+        seen = False
+        while time.time() - t0 < MAX_INITIAL_WAIT:
             try:
-                # attempt to find element; fallback to JS-based bounding rect click if element not accessible
-                try:
-                    el = driver.find_element("id", elid)
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                    time.sleep(0.25)
-                    ok = cdp_click_element(driver, el)
-                    log(f"CDP clicked iframe {elid}: {ok}")
-                except Exception:
-                    # fallback: try to dispatch click via JS on element reference (may fail if shadow)
-                    try:
-                        driver.execute_script("var el=document.getElementById(arguments[0]); if(el){ el.scrollIntoView({block:'center'}); el.click && el.click(); }", elid)
-                        log(f"Fallback JS clicked {elid}")
-                    except Exception:
-                        log(f"Could not click {elid} (continuing).")
+                v = driver.execute_script("return (document.querySelectorAll('iframe[src*=\"youtube.com\"]').length || document.querySelectorAll('video').length) || 0;")
+                if v and int(v) > 0:
+                    seen = True
+                    break
             except Exception:
                 pass
-
-        # attempt to start playback via postMessage for all iframes and play() for HTML5
-        started = play_all_via_page(driver)
-        log(f"playAll invoked: {started}")
-
-        # monitoring loop: wait until every tracked item ended or safety cap
-        start = time.time()
-        while True:
-            status = get_status(driver)
-            if not status:
-                log("No status available from page yet; retrying...")
-                time.sleep(POLL_INTERVAL)
-                if MAX_WAIT_SECONDS and (time.time()-start) > MAX_WAIT_SECONDS:
-                    log("Max wait reached, aborting.")
-                    break
-                continue
-
-            players = status.get("players", {}) or {}
-            html_videos = status.get("html_videos", {}) or {}
-
-            total = len(players) + len(html_videos)
-            ended = 0
-            # count ended players
-            for k, v in players.items():
-                if v.get("ended"):
-                    ended += 1
-            for k, v in html_videos.items():
-                if v.get("ended"):
-                    ended += 1
-
-            log(f"Status snapshot: players={len(players)} html_videos={len(html_videos)} total={total} ended={ended}")
-
-            # If there are no tracked items (we couldn't detect), try re-inject once more but avoid loops
-            if total == 0:
-                log("No tracked players/videos found. Re-attempting discovery once more after a short wait.")
-                time.sleep(2.0)
-                driver.execute_script(INJECT_WATCHER_JS, origin)
-                time.sleep(1.0)
-                status = get_status(driver)
-                players = (status.get("players", {}) if status else {})
-                html_videos = (status.get("html_videos", {}) if status else {})
-                total = len(players) + len(html_videos)
-                if total == 0:
-                    log("Still zero tracked items. This page may block access or use non-standard players. Exiting with code 2.")
-                    break
-
-            if ended >= total and total > 0:
-                log("All tracked videos reported ended.")
-                break
-
-            # safety cap
-            if MAX_WAIT_SECONDS and (time.time() - start) > MAX_WAIT_SECONDS:
-                log("Reached MAX_WAIT_SECONDS safety cap. Exiting monitor loop.")
-                break
-
-            time.sleep(POLL_INTERVAL)
-
-        log("Done monitoring. Cleaning up and closing browser.")
-        try:
+            time.sleep(1.0)
+        if not seen:
+            log("No iframes or video tags detected after wait. Exiting.")
             driver.quit()
-        except:
-            pass
-        return 0
+            return 2
+
+        origin = up.urlparse(driver.current_url).scheme + "://" + up.urlparse(driver.current_url).netloc
+        log(f"Resolved origin: {origin}")
+
+        # discover and patch all iframes (shadow-aware). registers players in window._emapp_all_players
+        log("Discovering and patching all youtube iframes (shadow-aware)...")
+        disc = driver.execute_script(INJECT_DISCOVER_AND_PATCH_JS, origin)
+        log(f"Discovery result: {disc}")
+
+        # ensure YT API
+        ok_api = ensure_yt_iframe_api(driver)
+        log(f"YouTube IFrame API ready: {ok_api}")
+
+        # create YT.Player for every registered iframe
+        res = create_yt_players(driver)
+        log(f"create_yt_players result: {res}")
+        # allow players to initialize
+        time.sleep(1.2)
+
+        # try to play via player.playVideo() and HTML5 play()
+        invoke_play_on_players(driver)
+        log("Invoked playVideo() on players and attempted HTML5 video play().")
+
+        # collect player ids we created
+        try:
+            player_ids = driver.execute_script("return Object.keys(window._emapp_yt_players || {});")
+        except Exception:
+            player_ids = []
+        log(f"YT player instances count: {len(player_ids)}")
+
+        # CDP click fallback to simulate user gestures for autoplay
+        if player_ids:
+            cdp_click_ids(driver, player_ids)
+        else:
+            log("No YT player instances found for CDP click fallback.")
+
+        # small delay after clicks
+        time.sleep(1.0)
+
+        # fetch times and compute remaining
+        players_info = fetch_players_times(driver)
+        if not players_info:
+            log("Could not fetch player times. Falling back to polite polling.")
+            polite_poll_for_end(driver)
+            driver.quit()
+            return 0
+
+        remaining_list = []
+        for pid, info in players_info.items():
+            st = info.get("state")
+            dur = info.get("duration")
+            cur = info.get("current")
+            # interpret state: 1 playing, 3 buffering, 2 paused, 0 ended
+            playing = (st == 1 or st == 3)
+            if dur is None or cur is None:
+                rem = None
+            else:
+                rem = int(max(0, int(dur) - int(cur)))
+            remaining_list.append( (pid, st, dur, cur, rem) )
+
+        log("Per-player scan:")
+        for pid, st, dur, cur, rem in remaining_list:
+            log(f"  {pid}: state={st} duration={dur} current={cur} remaining={rem}")
+
+        # choose wait strategy
+        rem_values = [r for (_,_,_,_,r) in remaining_list if isinstance(r, int)]
+        if rem_values:
+            max_rem = max(rem_values)
+            # digit-by-digit arithmetic example
+            # choose a player with that max_rem
+            ex = None
+            for pid, st, dur, cur, rem in remaining_list:
+                if isinstance(rem, int) and rem == max_rem:
+                    a = str(int(dur)).rjust(4,'0')
+                    b = str(int(cur)).rjust(4,'0')
+                    c = str(int(rem)).rjust(4,'0')
+                    ex = f"{a} - {b} = {c}"
+                    break
+            if ex:
+                log(f"Calculation example (duration - current = remaining): {ex}")
+            wait_for = int(max_rem) + BUFFER_AFTER
+            log(f"Sleeping max remaining {max_rem}s + {BUFFER_AFTER}s buffer = {wait_for}s.")
+            time.sleep(wait_for)
+
+            # final quick re-check via getPlayerState
+            try:
+                final_states = driver.execute_script(r"""
+                    (function(){
+                        var out = {};
+                        var map = window._emapp_yt_players || {};
+                        Object.keys(map).forEach(function(k){
+                            try {
+                                var p = map[k].player;
+                                var st = (p && p.getPlayerState) ? p.getPlayerState() : null;
+                                out[k] = {state:st};
+                            } catch(e){}
+                        });
+                        return out;
+                    })();
+                """)
+                total = len(final_states)
+                ended = sum(1 for v in final_states.values() if v.get('state') == 0)
+                log(f"After sleep: players ended={ended}/{total}")
+                if total>0 and ended>=total:
+                    log("All players ended. Done.")
+                    driver.quit()
+                    return 0
+                else:
+                    log("Not all ended after main sleep; entering polite poll fallback.")
+                    polite_poll_for_end(driver)
+                    driver.quit()
+                    return 0
+            except Exception as e:
+                log(f"Final check error: {e}; falling back to polite poll.")
+                polite_poll_for_end(driver)
+                driver.quit()
+                return 0
+        else:
+            log("No reliable duration/current values; falling back to polite poll.")
+            polite_poll_for_end(driver)
+            driver.quit()
+            return 0
 
     except Exception as e:
         log(f"Fatal error: {e}")
@@ -378,5 +452,5 @@ def main():
             pass
         return 3
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())
