@@ -1,40 +1,84 @@
 #!/usr/bin/env python3
 """
 watch_videos.py — Play ALL YouTube embeds on the emapp page inline and wait until every one ends.
-Customized for: http://emapp.cc/watch/[{"v":"RTLBD6wiAfw",...}] (2-minute video)
+Features:
+- Shadow-DOM-aware discovery of iframes
+- Patches iframe src with enablejsapi & origin
+- Loads YouTube IFrame API and creates YT.Player instances
+- Triggers playVideo() and uses CDP click fallback for autoplay
+- Computes remaining = duration - currentTime and sleeps the max remaining + buffer
+- Final check via getPlayerState(); polite fallback polling if needed
+- Uses a unique temporary Chrome profile per run to avoid "user data directory is already in use"
 """
 
-import os, time, math, sys, urllib.parse as up
+import os
+import time
+import math
+import sys
+import shutil
+import tempfile
+import atexit
+import socket
+import urllib.parse as up
+
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
-# ---------- CONFIG (customized for 2-min videos) ----------
-PAGE_URL = os.getenv("EMAPP_URL") or "http://emapp.cc/watch/[{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0}]"
-HEADLESS = False           # set False to watch it run; change to True once stable
-POLL_INTERVAL = 2.0        # fallback poll
+# ---------- CONFIG (edit if needed) ----------
+PAGE_URL = os.getenv("EMAPP_URL") or "http://emapp.cc/watch/[{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0},{\"v\":\"RTLBD6wiAfw\",\"t\":0}]"
+HEADLESS = False           # set False to watch the browser while testing
+POLL_INTERVAL = 2.0        # seconds for fallback polling
 MAX_INITIAL_WAIT = 180     # wait up to 3 minutes for iframes to appear (no-hurry)
 MAX_WAIT_SECONDS = 60*15   # safety cap 15 minutes for this short job
-BUFFER_AFTER = 4           # seconds buffer added to computed remaining
-# ---------------------------------------------------------
+BUFFER_AFTER = 4           # seconds extra after computed remaining
+# ------------------------------------------------
 
 def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
+# ---------- New robust setup_driver (unique user-data-dir) ----------
+def _random_free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
 def setup_driver():
+    # create unique temp profile dir for this run
+    profile_dir = tempfile.mkdtemp(prefix="selenium_profile_")
+    atexit.register(lambda: shutil.rmtree(profile_dir, ignore_errors=True))
+
     opts = Options()
     if HEADLESS:
         opts.add_argument("--headless=new")
+    # Use a fresh profile so concurrent runs won't conflict
+    opts.add_argument(f"--user-data-dir={profile_dir}")
+    # Stable flags for CI / headless runs
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--no-default-browser-check")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--mute-audio")
     opts.add_argument("--autoplay-policy=no-user-gesture-required")
+    # try to set a free remote debugging port to reduce collisions
+    try:
+        port = _random_free_port()
+        opts.add_argument(f"--remote-debugging-port={port}")
+    except Exception:
+        pass
+
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(120)
     return driver
+# ------------------------------------------------------------------
 
+# CDP click to simulate user gesture
 def cdp_click_element(driver, element):
     try:
         dim = driver.execute_script("const r=arguments[0].getBoundingClientRect(); return {left:r.left,top:r.top,width:r.width,height:r.height};", element)
@@ -49,7 +93,7 @@ def cdp_click_element(driver, element):
     except Exception:
         return False
 
-# discovery + patch
+# discovery + patch (shadow-aware)
 INJECT_DISCOVER_AND_PATCH_JS = r"""
 (function(origin){
     function walk(node, out){
@@ -358,11 +402,11 @@ def main():
                     a = str(int(dur)).rjust(4,'0'); b = str(int(cur)).rjust(4,'0'); c = str(int(rem)).rjust(4,'0')
                     ex = f"{a} - {b} = {c}"; break
             if ex: log(f"Calculation example (duration - current = remaining): {ex}")
-            # user said video ~2min -> example calculation here
-            log("Example: 0120 + 0004 = 0124 (120s duration + 4s buffer = 124s sleep).")
+            log(f"Example: 0120 + 0004 = 0124 (120s duration + 4s buffer = 124s sleep).")
             wait_for = int(max_rem) + BUFFER_AFTER
             log(f"Sleeping max remaining {max_rem}s + {BUFFER_AFTER}s buffer = {wait_for}s.")
             time.sleep(wait_for)
+
             # final re-check
             try:
                 final_states = driver.execute_script(r"""
